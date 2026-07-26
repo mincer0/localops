@@ -61,14 +61,21 @@ struct MenuPopoverView: View {
             .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
-        HStack {
-          Button {
-            model.openWebPage()
-          } label: {
-            Label("只读 Web", systemImage: "safari")
+        HStack(spacing: 10) {
+          VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 5) {
+              Circle().fill(webStatusColor).frame(width: 7, height: 7)
+              Text("只读 Web · \(webStatusText)")
+                .font(.caption.weight(.medium))
+            }
+            Text(webAddressText)
+              .font(.caption2.monospaced())
+              .foregroundStyle(.secondary)
+              .textSelection(.enabled)
           }
-          .disabled(model.webURL == nil)
           Spacer()
+          Button("打开") { model.openWebPage() }
+            .disabled(model.webURL == nil)
           Button("退出", action: quit)
         }
       }
@@ -99,6 +106,29 @@ struct MenuPopoverView: View {
         label: "温控",
         color: model.overview.system.thermalState.color
       )
+    }
+  }
+
+  private var webAddressText: String {
+    guard let url = model.webURL, let host = url.host else { return "127.0.0.1:8042" }
+    return "\(host):\(url.port ?? 8042)"
+  }
+
+  private var webStatusText: String {
+    switch model.webState {
+    case .stopped: "已停止"
+    case .starting: "启动中"
+    case .running: "运行中"
+    case .failed: "不可用"
+    }
+  }
+
+  private var webStatusColor: Color {
+    switch model.webState {
+    case .running: .green
+    case .starting: .orange
+    case .failed: .red
+    case .stopped: .secondary
     }
   }
 }

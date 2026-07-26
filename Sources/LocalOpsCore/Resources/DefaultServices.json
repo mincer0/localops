@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "services": [
+    {
+      "id": "omlx",
+      "name": "oMLX",
+      "group": "AI",
+      "description": "本机 OpenAI 兼容的 MLX 模型服务",
+      "enabled": true,
+      "endpoints": [
+        {
+          "name": "API 文档",
+          "url": "http://127.0.0.1:8000/docs"
+        }
+      ],
+      "health": {
+        "type": "http",
+        "url": "http://127.0.0.1:8000/health",
+        "host": "127.0.0.1",
+        "timeoutSeconds": 3
+      }
+    },
+    {
+      "id": "ltx-studio",
+      "name": "LTX Studio",
+      "group": "媒体",
+      "description": "本机视频生成与媒体工作台",
+      "enabled": true,
+      "endpoints": [
+        {
+          "name": "Web UI",
+          "url": "http://127.0.0.1:7860/"
+        }
+      ],
+      "health": {
+        "type": "http",
+        "url": "http://127.0.0.1:7860/",
+        "host": "127.0.0.1",
+        "timeoutSeconds": 3
+      }
+    }
+  ]
+}

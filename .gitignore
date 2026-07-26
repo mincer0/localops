@@ -1,0 +1,23 @@
+.DS_Store
+.build/
+.data/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.py[cod]
+settings.yaml
+/artifacts/*.png
+/dist/
+/macos/LocalOpsMenuBar/build/
+/macos/LocalOpsMenuBar/release/
+/build/
+/release/
+
+# Retired local experiments kept on this Mac, not part of the LocalOps product.
+/src/ai_cockpit/
+/config/capabilities.yaml
+/schemas/
+/settings.example.yaml
+/templates/dashboard.html
+/experimental/

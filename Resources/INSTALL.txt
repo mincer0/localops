@@ -1,0 +1,14 @@
+LocalOps 安装说明
+
+1. 将“LocalOps.app”拖入右侧的“Applications”文件夹。
+2. 从“应用程序”启动 LocalOps，它会常驻菜单栏。
+3. 菜单栏和原生管理窗口可查看、登记本地服务。
+4. 只读 Web 页面固定为 http://127.0.0.1:8042，随 App 启动和退出。
+
+当前 GitHub 开发构建使用 ad-hoc 签名。如果 macOS 首次打开时提示无法验证开发者，
+请在 Finder 中按住 Control 点击 LocalOps.app，选择“打开”。
+
+服务、历史和状态统一保存在：
+~/Library/Application Support/LocalOps/.data/localops.sqlite3
+
+旧版 services.yaml 和 claimed-services.yaml 只在升级时读取一次，新版运行不再依赖 YAML、Python 或 FastAPI。

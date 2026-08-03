@@ -18,6 +18,18 @@ public actor LocalOpsStore {
 
   public init(path: URL) throws {
     database = try DatabaseQueue(path: path.path)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+  }
+
+  /// Create one consistent SQLite backup before the first migration of a
+  /// database. `VACUUM INTO` includes WAL contents, unlike copying the main
+  /// file directly. Existing backups are never overwritten.
+  public func backupIfNeeded(to url: URL) throws {
+    guard !FileManager.default.fileExists(atPath: url.path) else { return }
+    try database.writeWithoutTransaction { db in
+      try db.execute(sql: "VACUUM INTO ?", arguments: [url.path])
+    }
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
   }
 
   public func migrate() throws {
@@ -93,12 +105,223 @@ public actor LocalOpsStore {
         table.column("message", .text).notNull()
       }
     }
+    migrator.registerMigration("swift-v2-trust") { db in
+      try db.create(table: "localops_migrations", options: .ifNotExists) { table in
+        table.column("name", .text).primaryKey()
+        table.column("completed_at", .text).notNull()
+      }
+      try db.create(table: "localops_refresh_state", options: .ifNotExists) { table in
+        table.column("id", .integer).primaryKey()
+        table.column("generation", .integer).notNull().defaults(to: 0)
+        table.column("attempted_at", .text)
+        table.column("successful_at", .text)
+      }
+      try db.create(table: "service_failure_state", options: .ifNotExists) { table in
+        table.column("service_id", .text).primaryKey()
+        table.column("consecutive_failures", .integer).notNull().defaults(to: 0)
+      }
+      try db.create(
+        index: "service_state_checked_at_idx",
+        on: "service_state",
+        columns: ["checked_at"],
+        options: .ifNotExists
+      )
+      try db.create(
+        index: "events_service_id_idx",
+        on: "events",
+        columns: ["service_id"],
+        options: .ifNotExists
+      )
+      // Existing databases predate foreign-key declarations.  Triggers give
+      // them the same delete semantics without rebuilding user data in place.
+      try db.execute(
+        sql: """
+          CREATE TRIGGER IF NOT EXISTS services_delete_state
+          AFTER DELETE ON services
+          BEGIN
+            DELETE FROM service_state WHERE service_id = OLD.id;
+            DELETE FROM events WHERE service_id = OLD.id;
+            UPDATE service_catalog SET claimed_service_id = NULL
+              WHERE claimed_service_id = OLD.id;
+            DELETE FROM service_failure_state WHERE service_id = OLD.id;
+          END
+          """)
+    }
+    migrator.registerMigration("swift-v3-service-editing") { db in
+      // A development build may have added one of these columns before the
+      // migration was registered. Inspect the schema first so retries remain
+      // idempotent on both old and partially upgraded databases.
+      let columns = Set(
+        try Row.fetchAll(db, sql: "PRAGMA table_info(services)").map {
+          (row: Row) -> String in row["name"]
+        })
+      if !columns.contains("management_kind") {
+        try db.execute(
+          sql: "ALTER TABLE services ADD COLUMN management_kind TEXT NOT NULL DEFAULT 'unknown'"
+        )
+      }
+      if !columns.contains("recovery_note") {
+        try db.execute(
+          sql: "ALTER TABLE services ADD COLUMN recovery_note TEXT NOT NULL DEFAULT ''"
+        )
+      }
+      if !columns.contains("notifications_muted") {
+        try db.execute(
+          sql: "ALTER TABLE services ADD COLUMN notifications_muted INTEGER NOT NULL DEFAULT 0"
+        )
+      }
+    }
     try migrator.migrate(database)
+    try database.write { db in
+      try db.execute(sql: "PRAGMA foreign_keys = ON")
+      let result = try String.fetchOne(db, sql: "PRAGMA integrity_check")
+      guard result?.lowercased() == "ok" else {
+        throw LocalOpsError.commandFailed("SQLite 完整性检查失败")
+      }
+      try db.execute(
+        sql: "INSERT OR IGNORE INTO localops_refresh_state (id, generation) VALUES (1, 0)"
+      )
+    }
+  }
+
+  public func hasMigrationMarker(_ name: String) throws -> Bool {
+    try database.read { db in
+      try Int.fetchOne(
+        db,
+        sql: "SELECT 1 FROM localops_migrations WHERE name = ? LIMIT 1",
+        arguments: [name]
+      ) != nil
+    }
+  }
+
+  public func markMigration(_ name: String, completedAt: Date = Date()) throws {
+    try database.write { db in
+      try db.execute(
+        sql: "INSERT OR REPLACE INTO localops_migrations (name, completed_at) VALUES (?, ?)",
+        arguments: [name, isoString(completedAt)]
+      )
+    }
   }
 
   public func seedDefaults(_ definitions: [ServiceDefinition]) throws {
     for definition in definitions {
       try saveDefinition(definition, builtIn: true, replace: false)
+    }
+  }
+
+  /// Remove the mutable LocalOps catalog and seed the supplied built-in
+  /// definitions in the same SQLite transaction. Migration markers and the
+  /// schema are deliberately left untouched so legacy YAML is not replayed
+  /// after a user reset. The caller must checkpoint/VACUUM and remove the
+  /// preflight backup only after this transaction succeeds.
+  public func clearCurrentDirectoryData(
+    seeding definitions: [ServiceDefinition],
+    completedAt: Date = Date()
+  ) throws {
+    let values = try definitions.map { try $0.validated() }
+    let ids = values.map(\.id)
+    guard Set(ids).count == ids.count else {
+      throw LocalOpsError.invalidService("默认服务 id 重复")
+    }
+    let encoded = try values.map {
+      (value: $0, endpoints: try encode($0.endpoints), health: try encode($0.health))
+    }
+    let now = isoString(completedAt)
+
+    try database.write { db in
+      // secure_delete is connection-scoped. Enable it before any DELETE in
+      // this transaction so SQLite overwrites deleted pages instead of
+      // leaving the old LocalOps catalog recoverable from free-list pages.
+      try db.execute(sql: "PRAGMA secure_delete = ON")
+      try db.execute(sql: "DELETE FROM action_audit")
+      try db.execute(sql: "DELETE FROM events")
+      try db.execute(sql: "DELETE FROM service_catalog")
+      try db.execute(sql: "DELETE FROM service_failure_state")
+      try db.execute(sql: "DELETE FROM service_state")
+      try db.execute(sql: "DELETE FROM services")
+      try db.execute(
+        sql: "INSERT OR IGNORE INTO localops_refresh_state (id, generation) VALUES (1, 0)"
+      )
+      try db.execute(
+        sql: """
+          UPDATE localops_refresh_state
+          SET generation = 0, attempted_at = NULL, successful_at = NULL
+          WHERE id = 1
+          """)
+
+      // The catalog is empty at this point, but keep the normal enabled-port
+      // invariant here so a malformed built-in bundle still rolls back the
+      // complete clear rather than leaving a partially reseeded database.
+      try validatePortConflicts(values, existingOwners: [:])
+      for item in encoded {
+        try insertDefinition(
+          item.value,
+          endpoints: item.endpoints,
+          health: item.health,
+          builtIn: true,
+          replace: false,
+          now: now,
+          in: db
+        )
+      }
+    }
+  }
+
+  /// Flush pending WAL pages and rebuild the database after a successful
+  /// clear transaction. This intentionally runs outside a transaction:
+  /// SQLite's VACUUM cannot run while a write transaction is active.
+  public func checkpointAndVacuum() throws {
+    try database.writeWithoutTransaction { db in
+      try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+      try db.execute(sql: "VACUUM")
+    }
+  }
+
+  public func commitRefresh(
+    snapshots: [ServiceSnapshot],
+    observed: [ListeningService],
+    attemptedAt: Date,
+    successfulAt: Date
+  ) throws -> (generation: Int64, snapshots: [ServiceSnapshot]) {
+    try database.write { db in
+      var effectiveSnapshots: [ServiceSnapshot] = []
+      for snapshot in snapshots {
+        effectiveSnapshots.append(try record(snapshot, in: db))
+      }
+      for listener in observed {
+        try recordObserved(listener, seenAt: successfulAt, in: db)
+      }
+      let previous =
+        try Int64.fetchOne(
+          db,
+          sql: "SELECT generation FROM localops_refresh_state WHERE id = 1"
+        ) ?? 0
+      let generation = previous + 1
+      try db.execute(
+        sql: """
+          UPDATE localops_refresh_state
+          SET generation = ?, attempted_at = ?, successful_at = ?
+          WHERE id = 1
+          """,
+        arguments: [generation, isoString(attemptedAt), isoString(successfulAt)]
+      )
+      try pruneEvents(in: db, now: successfulAt)
+      return (generation, effectiveSnapshots)
+    }
+  }
+
+  public func refreshState() throws -> (generation: Int64, successfulAt: Date?) {
+    try database.read { db in
+      let generation =
+        (try? Int64.fetchOne(
+          db,
+          sql: "SELECT generation FROM localops_refresh_state WHERE id = 1"
+        )) ?? 0
+      let successfulAt = try String.fetchOne(
+        db,
+        sql: "SELECT successful_at FROM localops_refresh_state WHERE id = 1"
+      )
+      return (max(0, generation), successfulAt.flatMap(parseISO))
     }
   }
 
@@ -112,63 +335,90 @@ public actor LocalOpsStore {
     let health = try encode(value.health)
     let now = isoString(Date())
     try database.write { db in
-      if replace {
-        try db.execute(
-          sql: """
-            INSERT INTO services (
-                id, name, group_name, description, enabled,
-                endpoints_json, health_json, is_builtin, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name=excluded.name,
-                group_name=excluded.group_name,
-                description=excluded.description,
-                enabled=excluded.enabled,
-                endpoints_json=excluded.endpoints_json,
-                health_json=excluded.health_json,
-                updated_at=excluded.updated_at
-            """,
-          arguments: [
-            value.id, value.name, value.group, value.description, value.enabled,
-            endpoints, health, builtIn, now, now,
-          ]
-        )
-      } else {
-        try db.execute(
-          sql: """
-            INSERT OR IGNORE INTO services (
-                id, name, group_name, description, enabled,
-                endpoints_json, health_json, is_builtin, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-          arguments: [
-            value.id, value.name, value.group, value.description, value.enabled,
-            endpoints, health, builtIn, now, now,
-          ]
+      let existingIDs = try existingServiceIDs(in: db)
+      let ignoredInsert = !replace && existingIDs.contains(value.id)
+      let existingOwners = try existingEnabledPortOwners(
+        in: db,
+        excluding: replace ? [value.id] : []
+      )
+      try validatePortConflicts(
+        ignoredInsert ? [] : [value],
+        existingOwners: existingOwners
+      )
+      if !ignoredInsert {
+        try insertDefinition(
+          value,
+          endpoints: endpoints,
+          health: health,
+          builtIn: builtIn,
+          replace: replace,
+          now: now,
+          in: db
         )
       }
     }
   }
 
-  public func loadDefinitions() throws -> [ServiceDefinition] {
+  /// Import legacy registrations atomically and mark the migration in the
+  /// same transaction. A retry rechecks the marker while holding the write
+  /// transaction, so a concurrent/partial import cannot leave half a catalog.
+  public func importLegacyDefinitions(
+    _ definitions: [ServiceDefinition],
+    marker: String = "legacy-services-v1",
+    completedAt: Date = Date()
+  ) throws {
+    let now = isoString(completedAt)
+    try database.write { db in
+      let alreadyMigrated =
+        try Int.fetchOne(
+          db,
+          sql: "SELECT 1 FROM localops_migrations WHERE name = ? LIMIT 1",
+          arguments: [marker]
+        ) != nil
+      guard !alreadyMigrated else { return }
+
+      let values = try definitions.map { try $0.validated() }
+      let ids = values.map(\.id)
+      guard Set(ids).count == ids.count else {
+        throw LocalOpsError.invalidService("旧版服务 id 重复")
+      }
+      let existingIDs = try existingServiceIDs(in: db)
+      let existingOwners = try existingEnabledPortOwners(in: db, excluding: [])
+      let toInsert = values.filter { !existingIDs.contains($0.id) }
+      try validatePortConflicts(toInsert, existingOwners: existingOwners)
+
+      for value in toInsert {
+        try insertDefinition(
+          value,
+          endpoints: try encode(value.endpoints),
+          health: try encode(value.health),
+          builtIn: false,
+          replace: false,
+          now: now,
+          in: db
+        )
+      }
+      try db.execute(
+        sql: "INSERT OR REPLACE INTO localops_migrations (name, completed_at) VALUES (?, ?)",
+        arguments: [marker, now]
+      )
+    }
+  }
+
+  /// Return every registered definition, including disabled entries. Values
+  /// are validated individually and sorted by stable, binary string keys.
+  /// Port conflicts are enforced only among enabled definitions so operators
+  /// can inspect and later re-enable a disabled registration.
+  public func definitions() throws -> [ServiceDefinition] {
     let definitions = try database.read { db in
       try Row.fetchAll(
         db,
         sql: """
-          SELECT id, name, group_name, description, enabled, endpoints_json, health_json
-          FROM services WHERE enabled = 1 ORDER BY group_name, name
+          SELECT id, name, group_name, description, enabled, endpoints_json, health_json,
+                 management_kind, recovery_note, notifications_muted
+          FROM services ORDER BY group_name, name, id
           """
-      ).map { row -> ServiceDefinition in
-        ServiceDefinition(
-          id: row["id"],
-          name: row["name"],
-          group: row["group_name"],
-          description: row["description"],
-          enabled: row["enabled"],
-          endpoints: try decode([ServiceEndpoint].self, from: row["endpoints_json"]),
-          health: try decode(ServiceHealthCheck.self, from: row["health_json"])
-        )
-      }
+      ).map { try serviceDefinition($0) }
     }
     var seenIds = Set<String>()
     var occupiedPorts: [Int: String] = [:]
@@ -177,14 +427,80 @@ public actor LocalOpsStore {
       guard seenIds.insert(definition.id).inserted else {
         throw LocalOpsError.invalidService("服务 id 重复：\(definition.id)")
       }
-      for port in definition.ports {
-        if let owner = occupiedPorts[port] {
-          throw LocalOpsError.invalidService("端口 \(port) 同时由 \(owner) 和 \(definition.id) 登记")
+      if definition.enabled {
+        for port in definition.ports {
+          if let owner = occupiedPorts[port] {
+            throw LocalOpsError.invalidService("端口 \(port) 同时由 \(owner) 和 \(definition.id) 登记")
+          }
+          occupiedPorts[port] = definition.id
         }
-        occupiedPorts[port] = definition.id
       }
     }
     return definitions
+  }
+
+  /// Runtime refresh only probes enabled definitions. Use `definitions()`
+  /// when the caller needs the complete editable catalog.
+  public func loadDefinitions() throws -> [ServiceDefinition] {
+    try definitions().filter(\.enabled)
+  }
+
+  /// Read a registered definition regardless of its enabled state. The
+  /// editing API uses this to distinguish an absent service from a disabled
+  /// one while keeping refresh limited to enabled definitions.
+  public func loadDefinition(id: String) throws -> ServiceDefinition? {
+    try database.read { db in
+      guard
+        let row = try Row.fetchOne(
+          db,
+          sql: """
+            SELECT id, name, group_name, description, enabled, endpoints_json, health_json,
+                   management_kind, recovery_note, notifications_muted
+            FROM services WHERE id = ? LIMIT 1
+            """,
+          arguments: [id]
+        )
+      else { return nil }
+      let definition = try serviceDefinition(row)
+      return try definition.validated()
+    }
+  }
+
+  /// Persist an edit to an existing registration. The SQL update deliberately
+  /// does not touch `is_builtin`, so callers cannot change built-in ownership
+  /// through this API.
+  public func updateDefinition(_ definition: ServiceDefinition) throws {
+    let value = try definition.validated()
+    let endpoints = try encode(value.endpoints)
+    let health = try encode(value.health)
+    let now = isoString(Date())
+    try database.write { db in
+      let exists =
+        try Int.fetchOne(
+          db,
+          sql: "SELECT 1 FROM services WHERE id = ? LIMIT 1",
+          arguments: [value.id]
+        ) != nil
+      guard exists else {
+        throw LocalOpsError.invalidService("找不到登记服务：\(value.id)")
+      }
+      let existingOwners = try existingEnabledPortOwners(in: db, excluding: [value.id])
+      try validatePortConflicts([value], existingOwners: existingOwners)
+      try db.execute(
+        sql: """
+          UPDATE services SET
+            name = ?, group_name = ?, description = ?, enabled = ?,
+            endpoints_json = ?, health_json = ?, management_kind = ?,
+            recovery_note = ?, notifications_muted = ?, updated_at = ?
+          WHERE id = ?
+          """,
+        arguments: [
+          value.name, value.group, value.description, value.enabled,
+          endpoints, health, value.managementKind.rawValue, value.recoveryNote,
+          value.notificationsMuted, now, value.id,
+        ]
+      )
+    }
   }
 
   public func deleteDefinition(id: String) throws {
@@ -193,83 +509,120 @@ public actor LocalOpsStore {
     }
   }
 
-  public func record(_ snapshot: ServiceSnapshot) throws {
-    guard let checkedAt = snapshot.checkedAt else { return }
-    let details = try encode(snapshot)
-    let checked = isoString(checkedAt)
-    try database.write { db in
-      let previous = try Row.fetchOne(
-        db,
-        sql: "SELECT lifecycle, health FROM service_state WHERE service_id = ?",
-        arguments: [snapshot.id]
-      )
+  private func insertDefinition(
+    _ value: ServiceDefinition,
+    endpoints: String,
+    health: String,
+    builtIn: Bool,
+    replace: Bool,
+    now: String,
+    in db: Database
+  ) throws {
+    if replace {
       try db.execute(
         sql: """
-          INSERT INTO service_state (
-              service_id, service_name, source, lifecycle, health,
-              latency_ms, checked_at, details_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(service_id) DO UPDATE SET
-              service_name=excluded.service_name,
-              source=excluded.source,
-              lifecycle=excluded.lifecycle,
-              health=excluded.health,
-              latency_ms=excluded.latency_ms,
-              checked_at=excluded.checked_at,
-              details_json=excluded.details_json
+          INSERT INTO services (
+              id, name, group_name, description, enabled,
+              endpoints_json, health_json, management_kind, recovery_note,
+              notifications_muted, is_builtin, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+              name=excluded.name,
+              group_name=excluded.group_name,
+              description=excluded.description,
+              enabled=excluded.enabled,
+              endpoints_json=excluded.endpoints_json,
+              health_json=excluded.health_json,
+              management_kind=excluded.management_kind,
+              recovery_note=excluded.recovery_note,
+              notifications_muted=excluded.notifications_muted,
+              updated_at=excluded.updated_at
           """,
         arguments: [
-          snapshot.id, snapshot.name, snapshot.source.rawValue,
-          snapshot.lifecycle.rawValue, snapshot.health.rawValue,
-          snapshot.latencyMs, checked, details,
+          value.id, value.name, value.group, value.description, value.enabled,
+          endpoints, health, value.managementKind.rawValue, value.recoveryNote,
+          value.notificationsMuted, builtIn, now, now,
         ]
       )
-      let previousLifecycle: String? = previous?["lifecycle"]
-      let previousHealth: String? = previous?["health"]
-      if previousLifecycle != snapshot.lifecycle.rawValue
-        || previousHealth != snapshot.health.rawValue
-      {
-        let event = transitionEvent(for: snapshot, hadPreviousState: previous != nil)
-        try db.execute(
-          sql: """
-            INSERT INTO events (
-                occurred_at, service_id, service_name, kind, severity, message
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-          arguments: [
-            checked, snapshot.id, snapshot.name, event.kind, event.severity, event.message,
-          ]
-        )
+    } else {
+      try db.execute(
+        sql: """
+          INSERT OR IGNORE INTO services (
+              id, name, group_name, description, enabled,
+              endpoints_json, health_json, management_kind, recovery_note,
+              notifications_muted, is_builtin, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+        arguments: [
+          value.id, value.name, value.group, value.description, value.enabled,
+          endpoints, health, value.managementKind.rawValue, value.recoveryNote,
+          value.notificationsMuted, builtIn, now, now,
+        ]
+      )
+    }
+  }
+
+  private func existingServiceIDs(in db: Database) throws -> Set<String> {
+    Set(try String.fetchAll(db, sql: "SELECT id FROM services"))
+  }
+
+  private func existingEnabledPortOwners(
+    in db: Database,
+    excluding ids: Set<String>
+  ) throws -> [Int: String] {
+    let rows = try Row.fetchAll(
+      db,
+      sql: """
+        SELECT id, endpoints_json, health_json
+        FROM services WHERE enabled = 1
+        """
+    )
+    var owners: [Int: String] = [:]
+    for row in rows {
+      let id: String = row["id"]
+      guard !ids.contains(id) else { continue }
+      let endpoints = try decode([ServiceEndpoint].self, from: row["endpoints_json"])
+      let health = try decode(ServiceHealthCheck.self, from: row["health_json"])
+      for port in ServiceDefinition(
+        id: id,
+        name: id,
+        endpoints: endpoints,
+        health: health
+      ).ports {
+        owners[port] = id
+      }
+    }
+    return owners
+  }
+
+  private func validatePortConflicts(
+    _ definitions: [ServiceDefinition],
+    existingOwners: [Int: String]
+  ) throws {
+    var owners = existingOwners
+    for definition in definitions where definition.enabled {
+      for port in definition.ports {
+        if let owner = owners[port], owner != definition.id {
+          throw LocalOpsError.invalidService(
+            "端口 \(port) 同时由 \(owner) 和 \(definition.id) 登记"
+          )
+        }
+        owners[port] = definition.id
       }
     }
   }
 
-  public func recordObserved(_ listener: ListeningService, seenAt: Date = Date()) throws {
-    let timestamp = isoString(seenAt)
-    let metadata = try encode(listener)
+  public func record(_ snapshot: ServiceSnapshot) throws {
+    guard let checkedAt = snapshot.checkedAt else { return }
     try database.write { db in
-      try db.execute(
-        sql: """
-          INSERT INTO service_catalog (
-              id, process_name, executable_path, working_directory,
-              host, port, first_seen_at, last_seen_at, last_pid, metadata_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-              process_name=excluded.process_name,
-              executable_path=COALESCE(excluded.executable_path, executable_path),
-              working_directory=COALESCE(excluded.working_directory, working_directory),
-              host=excluded.host,
-              port=excluded.port,
-              last_seen_at=excluded.last_seen_at,
-              last_pid=excluded.last_pid,
-              metadata_json=excluded.metadata_json
-          """,
-        arguments: [
-          listener.stableId, listener.processName, listener.executablePath,
-          listener.workingDirectory, listener.normalizedHost, listener.port,
-          timestamp, timestamp, listener.pid, metadata,
-        ]
-      )
+      _ = try record(snapshot, in: db)
+      try pruneEvents(in: db, now: checkedAt)
+    }
+  }
+
+  public func recordObserved(_ listener: ListeningService, seenAt: Date = Date()) throws {
+    try database.write { db in
+      try recordObserved(listener, seenAt: seenAt, in: db)
     }
   }
 
@@ -336,6 +689,125 @@ public actor LocalOpsStore {
     }
   }
 
+  private func record(_ snapshot: ServiceSnapshot, in db: Database) throws -> ServiceSnapshot {
+    guard let checkedAt = snapshot.checkedAt else { return snapshot }
+    let previous = try Row.fetchOne(
+      db,
+      sql: "SELECT lifecycle, health FROM service_state WHERE service_id = ?",
+      arguments: [snapshot.id]
+    )
+    let previousFailures =
+      try Int.fetchOne(
+        db,
+        sql: "SELECT consecutive_failures FROM service_failure_state WHERE service_id = ?",
+        arguments: [snapshot.id]
+      ) ?? 0
+    let failed = snapshot.lifecycle == .stopped || snapshot.health == .unhealthy
+    let failures = failed ? min(previousFailures + 1, 3) : 0
+    var effective = snapshot
+    if failed, failures < 2 {
+      let previousLifecycle: String? = previous?["lifecycle"]
+      effective.lifecycle =
+        previousLifecycle == ServiceLifecycle.running.rawValue
+        ? .running : .unknown
+      effective.health = .degraded
+      effective.presence = effective.lifecycle == .running ? .online : .unknown
+      effective.message = "连续失败 \(failures)/2，暂不判定服务离线"
+      effective.observation.freshness = .partial
+    }
+    let details = try encode(effective)
+    let checked = isoString(checkedAt)
+    try db.execute(
+      sql: """
+        INSERT INTO service_state (
+            service_id, service_name, source, lifecycle, health,
+            latency_ms, checked_at, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(service_id) DO UPDATE SET
+            service_name=excluded.service_name,
+            source=excluded.source,
+            lifecycle=excluded.lifecycle,
+            health=excluded.health,
+            latency_ms=excluded.latency_ms,
+            checked_at=excluded.checked_at,
+            details_json=excluded.details_json
+        """,
+      arguments: [
+        effective.id, effective.name, effective.source.rawValue,
+        effective.lifecycle.rawValue, effective.health.rawValue,
+        effective.latencyMs, checked, details,
+      ]
+    )
+    try db.execute(
+      sql: """
+        INSERT INTO service_failure_state (service_id, consecutive_failures)
+        VALUES (?, ?)
+        ON CONFLICT(service_id) DO UPDATE SET consecutive_failures = excluded.consecutive_failures
+        """,
+      arguments: [effective.id, failures]
+    )
+    let previousLifecycle: String? = previous?["lifecycle"]
+    let previousHealth: String? = previous?["health"]
+    if previousLifecycle != effective.lifecycle.rawValue
+      || previousHealth != effective.health.rawValue
+    {
+      let event = transitionEvent(for: effective, hadPreviousState: previous != nil)
+      try db.execute(
+        sql: """
+          INSERT INTO events (
+              occurred_at, service_id, service_name, kind, severity, message
+          ) VALUES (?, ?, ?, ?, ?, ?)
+          """,
+        arguments: [
+          checked, effective.id, effective.name, event.kind, event.severity, event.message,
+        ]
+      )
+    }
+    return effective
+  }
+
+  private func recordObserved(
+    _ listener: ListeningService,
+    seenAt: Date,
+    in db: Database
+  ) throws {
+    let timestamp = isoString(seenAt)
+    let metadata = try encode(listener)
+    try db.execute(
+      sql: """
+        INSERT INTO service_catalog (
+            id, process_name, executable_path, working_directory,
+            host, port, first_seen_at, last_seen_at, last_pid, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            process_name=excluded.process_name,
+            executable_path=COALESCE(excluded.executable_path, executable_path),
+            working_directory=COALESCE(excluded.working_directory, working_directory),
+            host=excluded.host,
+            port=excluded.port,
+            last_seen_at=excluded.last_seen_at,
+            last_pid=excluded.last_pid,
+            metadata_json=excluded.metadata_json
+        """,
+      arguments: [
+        listener.stableId, listener.processName, listener.executablePath,
+        listener.workingDirectory, listener.normalizedHost, listener.port,
+        timestamp, timestamp, listener.pid, metadata,
+      ]
+    )
+  }
+
+  private func pruneEvents(in db: Database, now: Date) throws {
+    let cutoff = isoString(now.addingTimeInterval(-30 * 24 * 60 * 60))
+    try db.execute(sql: "DELETE FROM events WHERE occurred_at < ?", arguments: [cutoff])
+    try db.execute(
+      sql: """
+        DELETE FROM events
+        WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 10000)
+        """
+    )
+  }
+
   public func isReady() -> Bool {
     (try? database.read { db in try Int.fetchOne(db, sql: "SELECT 1") }) != nil
   }
@@ -361,6 +833,22 @@ private func transitionEvent(
   }
   return (
     "state_changed", "info", "状态变为 \(snapshot.lifecycle.rawValue) / \(snapshot.health.rawValue)"
+  )
+}
+
+private func serviceDefinition(_ row: Row) throws -> ServiceDefinition {
+  let rawManagementKind: String = row["management_kind"] ?? "unknown"
+  return ServiceDefinition(
+    id: row["id"],
+    name: row["name"],
+    group: row["group_name"],
+    description: row["description"],
+    enabled: row["enabled"],
+    endpoints: try decode([ServiceEndpoint].self, from: row["endpoints_json"]),
+    health: try decode(ServiceHealthCheck.self, from: row["health_json"]),
+    managementKind: ServiceManagementKind(rawValue: rawManagementKind) ?? .unknown,
+    recoveryNote: row["recovery_note"] ?? "",
+    notificationsMuted: row["notifications_muted"] ?? false
   )
 }
 

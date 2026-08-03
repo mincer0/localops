@@ -10,7 +10,6 @@ let package = Package(
   ],
   products: [
     .executable(name: "LocalOps", targets: ["LocalOpsApp"]),
-    .executable(name: "LocalOpsTests", targets: ["LocalOpsTests"]),
     .library(name: "LocalOpsCore", targets: ["LocalOpsCore"]),
     .library(name: "LocalOpsWeb", targets: ["LocalOpsWeb"]),
   ],
@@ -52,7 +51,7 @@ let package = Package(
       dependencies: ["LocalOpsCore", "LocalOpsWeb"],
       swiftSettings: [.swiftLanguageMode(.v6)]
     ),
-    .executableTarget(
+    .testTarget(
       name: "LocalOpsTests",
       dependencies: ["LocalOpsCore", "LocalOpsWeb"],
       path: "tests/LocalOpsTests",

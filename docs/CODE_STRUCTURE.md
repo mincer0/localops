@@ -20,12 +20,19 @@ LocalOps/
 │   └── LocalOpsApp/
 │       ├── main.swift
 │       ├── AppDelegate.swift
+│       ├── DiagnosticsExporter.swift
+│       ├── LocalOpsInstanceLock.swift
 │       ├── LocalOpsAppModel.swift
+│       ├── LocalURLPolicy.swift
+│       ├── NotificationCoordinator.swift
+│       ├── SnapshotProjection.swift
 │       ├── DashboardWindowController.swift
-│       ├── Views.swift
-│       └── LegacyBackendCleanup.swift
-├── tests/LocalOpsTests/main.swift
+│       └── Views.swift
+├── tests/LocalOpsTests/
+│   ├── LocalOpsTests.swift
+│   └── ReliabilityTestSkeleton.swift
 ├── Scripts/
+│   ├── ci-quality.sh
 │   ├── test.sh
 │   ├── build-app.sh
 │   └── build-dmg.sh
@@ -35,6 +42,11 @@ LocalOps/
 │   └── INSTALL.txt
 └── docs/
 ```
+
+GitHub Actions 在 `.github/workflows/ci.yml` 和
+`.github/workflows/release-candidate.yml` 中锁定 arm64 `macos-15`、Xcode
+16.4/Swift 6.1，并复用 `Scripts/ci-quality.sh` 的格式、构建、测试、安全和
+供应链报告门禁。
 
 依赖方向是单向的：
 

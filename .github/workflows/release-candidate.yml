@@ -1,0 +1,117 @@
+name: LocalOps release candidate
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build (for example v1.0.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Build candidate artifact (no publish)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Select pinned Xcode 16.4 toolchain
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == "arm64" ]] || {
+            echo "arm64 runner required" >&2
+            exit 1
+          }
+          DEVELOPER_DIR="/Applications/Xcode_16.4.app/Contents/Developer"
+          [[ -d "$DEVELOPER_DIR" ]] || {
+            echo "missing pinned toolchain: $DEVELOPER_DIR" >&2
+            exit 1
+          }
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          swift --version | tee /tmp/localops-swift-version.txt
+          grep -Eq 'Swift version 6\.1([.[:space:]]|$)|Apple Swift version 6\.1([.[:space:]]|$)' \
+            /tmp/localops-swift-version.txt
+
+      - name: Install quality tools
+        run: brew install swift-format gitleaks syft osv-scanner
+
+      - name: Strict Swift format
+        run: swift-format lint --recursive --strict Package.swift Sources tests
+
+      - name: Verify tag and single-source version
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          TAG_NAME="${REQUESTED_TAG:-${GITHUB_REF_NAME}}"
+          TAG_VERSION="${TAG_NAME#v}"
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          [[ "$TAG_VERSION" == "$PLIST_VERSION" ]] || {
+            echo "tag $TAG_NAME does not match Info.plist $PLIST_VERSION" >&2
+            exit 1
+          }
+          [[ "$TAG_NAME" == v* ]] || {
+            echo "candidate builds require a v<version> tag" >&2
+            exit 1
+          }
+
+      - name: Run all quality gates
+        env:
+          LOCALOPS_FORBID_XCTSKIP: "1"
+        run: ./Scripts/ci-quality.sh
+
+      - name: Build and verify DMG candidate
+        run: ./Scripts/build-dmg.sh
+
+      - name: Verify candidate architecture, dSYM, version, and hash
+        run: |
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)"
+          [[ "$(uname -m)" == "arm64" ]]
+          [[ "$(/usr/bin/lipo -archs build/LocalOps.app/Contents/MacOS/LocalOps)" == "arm64" ]]
+          [[ -d "build/LocalOps-${VERSION}-${BUILD_NUMBER}-arm64.dSYM" ]]
+          DMG="release/LocalOps-${VERSION}-arm64.dmg"
+          (cd release && shasum -a 256 -c "${DMG##*/}.sha256")
+
+      - name: Archive dSYM and candidate metadata
+        run: |
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)"
+          mkdir -p build/candidate
+          DSYM="build/LocalOps-${VERSION}-${BUILD_NUMBER}-arm64.dSYM"
+          [[ -d "$DSYM" ]] || { echo "missing $DSYM" >&2; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent "$DSYM" \
+            "build/candidate/LocalOps-${VERSION}-${BUILD_NUMBER}-arm64.dSYM.zip"
+          cp "release/LocalOps-${VERSION}-arm64.dmg" build/candidate/
+          cp "release/LocalOps-${VERSION}-arm64.dmg.sha256" build/candidate/
+          cp build/ci/localops-sbom.spdx.json build/candidate/
+          cp build/ci/dependency-licenses.txt build/candidate/
+          shasum -a 256 build/candidate/* > build/candidate/SHA256SUMS
+          {
+            echo "version=$VERSION"
+            echo "build=$BUILD_NUMBER"
+            echo "tag=${GITHUB_REF_NAME}"
+            echo "candidate_only=true"
+            echo "developer_id=not configured"
+          } > build/candidate/BUILD-METADATA.txt
+
+      - name: Upload candidate artifact only
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalOps-${{ github.ref_name }}-candidate
+          if-no-files-found: error
+          path: build/candidate/

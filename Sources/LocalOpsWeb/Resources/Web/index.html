@@ -4,68 +4,72 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>LocalOps · 本地服务</title>
+  <title>LocalOps · 本地服务目录</title>
   <link rel="stylesheet" href="/static/localops.css">
   <script src="/static/localops.js" defer></script>
 </head>
 <body>
   <header class="topbar">
     <div>
-      <p class="eyebrow">LOCAL SERVICE STATUS</p>
-      <h1>LocalOps</h1>
-      <p class="subtitle">这台 Mac 上的本地服务。此页只读，不会执行启动或停止操作。</p>
+      <p class="eyebrow">LOCALOPS · READ ONLY</p>
+      <h1>本地服务目录</h1>
+      <p class="subtitle">这台 Mac 上的本地服务快照。此页只读，不会控制、启动或停止已登记服务。</p>
     </div>
-    <div id="refresh-state" class="refresh-state">正在连接…</div>
+    <div id="refresh-state" class="refresh-state" role="status" aria-live="polite">正在连接…</div>
   </header>
-
   <main>
-    <section class="summary-grid" aria-label="状态摘要">
-      <article><span>已登记</span><strong id="total">0</strong></article>
-      <article><span>健康</span><strong id="healthy" class="good">0</strong></article>
-      <article><span>需关注</span><strong id="attention" class="warn">0</strong></article>
-      <article><span>待登记</span><strong id="discovered">0</strong></article>
+    <section id="state-card" class="state-card" aria-labelledby="state-title">
+      <div>
+        <p class="eyebrow">SNAPSHOT</p>
+        <h2 id="state-title">正在准备目录</h2>
+        <p id="state-detail" class="state-detail">正在读取 LocalOps 的最新结果。</p>
+      </div>
+      <div class="summary-line">
+        <span><strong id="healthy">0</strong> 健康</span>
+        <span><strong id="attention">0</strong> 需关注</span>
+        <span><strong id="total">0</strong> 已登记</span>
+      </div>
     </section>
-
-    <section class="machine-section" aria-labelledby="machine-title">
+    <section class="machine-section">
+      <details>
+        <summary>本机信息</summary>
+        <dl class="machine-list">
+          <div><dt>内存</dt><dd id="memory">—</dd></div>
+          <div><dt>磁盘可用</dt><dd id="disk">—</dd></div>
+          <div><dt>热状态</dt><dd id="thermal">—</dd></div>
+          <div><dt>CPU Load</dt><dd id="cpu-load">—</dd></div>
+          <div><dt>开机时长</dt><dd id="uptime">—</dd></div>
+        </dl>
+      </details>
+    </section>
+    <section class="directory-section" aria-labelledby="services-title">
       <div class="section-title">
-        <div><p class="eyebrow">HOST</p><h2 id="machine-title">机器状态</h2></div>
-        <span>热状态来自 macOS，不读取私有温度传感器</span>
+        <div><p class="eyebrow">SERVICES</p><h2 id="services-title">服务</h2></div>
+        <span id="discovered-note">—</span>
       </div>
-      <div class="machine-grid">
-      <article><span>内存</span><strong id="memory">—</strong></article>
-      <article><span>磁盘可用</span><strong id="disk">—</strong></article>
-        <article><span>热状态</span><strong id="thermal">—</strong></article>
-        <article><span>CPU Load</span><strong id="cpu-load">—</strong></article>
-        <article><span>开机时长</span><strong id="uptime">—</strong></article>
+      <div class="toolbar">
+        <div id="filters" class="filters" role="group" aria-label="筛选服务">
+          <button class="active" data-filter="all" aria-pressed="true">全部</button>
+          <button data-filter="registered" aria-pressed="false">已登记</button>
+          <button data-filter="discovered" aria-pressed="false">待登记</button>
+          <button data-filter="history" aria-pressed="false">最近掉线</button>
+        </div>
+        <label class="search">
+          <span class="sr-only">搜索服务</span>
+          <input id="search" type="search" placeholder="搜索名称、分组或端口">
+        </label>
       </div>
+      <p id="error" class="error" hidden></p>
+      <section id="services" class="service-list" aria-live="polite"></section>
+      <p id="empty" class="empty" hidden>没有匹配的服务。</p>
     </section>
-
-    <section class="toolbar">
-      <div id="filters" class="filters" role="group" aria-label="筛选">
-        <button class="active" data-filter="all">全部</button>
-        <button data-filter="registered">已登记</button>
-        <button data-filter="discovered">待登记</button>
-        <button data-filter="history">最近掉线</button>
-      </div>
-      <label class="search">
-        <span class="sr-only">搜索服务</span>
-        <input id="search" type="search" placeholder="搜索名称、分组或端口">
-      </label>
-    </section>
-
-    <p id="error" class="error" hidden></p>
-    <section id="services" class="service-grid" aria-live="polite"></section>
-    <p id="empty" class="empty" hidden>没有匹配的服务。</p>
-
-    <section class="events-section">
-      <div class="section-title">
-        <div><p class="eyebrow">HISTORY</p><h2>最近事件</h2></div>
-        <span>只记录已登记服务的状态变化</span>
-      </div>
-      <div id="events" class="events"></div>
+    <section class="events-section" aria-labelledby="events-title">
+      <details>
+        <summary><span><span class="eyebrow">RECENT CHANGES</span><span id="events-title" class="summary-heading">最近变化</span></span></summary>
+        <div id="events" class="events"></div>
+      </details>
     </section>
   </main>
-
   <footer>仅监听 <code>127.0.0.1</code> · 数据来自 LocalOps Swift Core</footer>
 </body>
 </html>

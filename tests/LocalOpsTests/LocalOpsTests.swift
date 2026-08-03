@@ -1,56 +1,23 @@
 import Foundation
 import LocalOpsCore
 import LocalOpsWeb
+import XCTest
 
-@main
-enum LocalOpsTestRunner {
-  static func main() async {
-    let tests: [(String, () async throws -> Void)] = [
-      ("default services", testDefaultServices),
-      ("address parsing", testAddressParsing),
-      ("stable observed identity", testStableIdentity),
-      ("legacy YAML migration", testLegacyMigration),
-      ("GRDB persistence", testStore),
-      ("system operations metrics", testSystemMetrics),
-      ("engine aggregation and history", testEngine),
-      ("discovered registration workflow", testRegistrationWorkflow),
-      ("observed forget workflow", testForgetWorkflow),
-      ("FlyingFox read-only routes", testWeb),
-    ]
-
-    var failures: [String] = []
-    for (name, test) in tests {
-      do {
-        try await test()
-        print("✓ \(name)")
-      } catch {
-        failures.append("\(name): \(error)")
-        print("✗ \(name): \(error)")
-      }
-    }
-
-    if failures.isEmpty {
-      print("\n\(tests.count)/\(tests.count) Swift tests passed")
-    } else {
-      print("\n\(failures.count) test(s) failed")
-      exit(1)
-    }
-  }
-
-  private static func testDefaultServices() async throws {
+final class LocalOpsTests: XCTestCase {
+  func testDefaultServices() throws {
     let services = try LocalOpsEngine.loadDefaultDefinitions()
-    try check(Set(services.map(\.id)).count == services.count, "duplicate default id")
-    try check(services.contains { $0.id == "omlx" && $0.health.type == .http }, "oMLX missing")
+    XCTAssertEqual(Set(services.map(\.id)).count, services.count, "duplicate default id")
+    XCTAssertTrue(services.contains { $0.id == "omlx" && $0.health.type == .http }, "oMLX missing")
   }
 
-  private static func testAddressParsing() async throws {
-    try check(parseListeningAddress("127.0.0.1:8042")?.host == "127.0.0.1", "IPv4")
-    try check(parseListeningAddress("[::1]:9000")?.port == 9000, "IPv6")
-    try check(parseListeningAddress("*:7860")?.host == "*", "wildcard")
-    try check(parseListeningAddress("broken") == nil, "invalid address")
+  func testAddressParsing() {
+    XCTAssertEqual(parseListeningAddress("127.0.0.1:8042")?.host, "127.0.0.1")
+    XCTAssertEqual(parseListeningAddress("[::1]:9000")?.port, 9000)
+    XCTAssertEqual(parseListeningAddress("*:7860")?.host, "*")
+    XCTAssertNil(parseListeningAddress("broken"))
   }
 
-  private static func testStableIdentity() async throws {
+  func testStableIdentity() {
     let first = ListeningService(
       pid: 100,
       processName: "python",
@@ -62,22 +29,23 @@ enum LocalOpsTestRunner {
     var restarted = first
     restarted.pid = 200
     restarted.host = "127.0.0.1"
-    try check(first.stableId == restarted.stableId, "identity changed with PID")
+    XCTAssertEqual(first.stableId, restarted.stableId, "identity changed with PID")
   }
 
-  private static func testLegacyMigration() async throws {
-    let directory = try temporaryDirectory()
+  func testLegacyMigration() throws {
+    let directory = try Self.temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let file = directory.appendingPathComponent("services.yaml")
-    try legacyYAML.write(to: file, atomically: true, encoding: .utf8)
+    try Self.legacyYAML.write(to: file, atomically: true, encoding: .utf8)
+
     let result = LegacyServiceMigrator().load(from: [file])
-    try check(result.count == 1, "legacy service count")
-    try check(result.first?.id == "demo", "legacy id")
-    try check(result.first?.health.port == 9123, "legacy health port")
+    XCTAssertEqual(result.count, 1, "legacy service count")
+    XCTAssertEqual(result.first?.id, "demo", "legacy id")
+    XCTAssertEqual(result.first?.health.port, 9123, "legacy health port")
   }
 
-  private static func testStore() async throws {
-    let directory = try temporaryDirectory()
+  func testStore() async throws {
+    let directory = try Self.temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try LocalOpsStore(path: directory.appendingPathComponent("localops.sqlite3"))
     try await store.migrate()
@@ -89,7 +57,8 @@ enum LocalOpsTestRunner {
       health: .init(type: .tcp, port: 9123)
     )
     try await store.saveDefinition(definition)
-    try check(try await store.loadDefinitions().map(\.id) == ["demo"], "definition persistence")
+    let definitions = try await store.loadDefinitions()
+    XCTAssertEqual(definitions.map(\.id), ["demo"], "definition persistence")
 
     try await store.record(
       ServiceSnapshot(
@@ -104,7 +73,8 @@ enum LocalOpsTestRunner {
         message: "offline",
         presence: .offline
       ))
-    try check(try await store.listEvents().first?.kind == "discovered", "event persistence")
+    let firstEventKind = try await store.listEvents().first?.kind
+    XCTAssertEqual(firstEventKind, "discovered", "event persistence")
 
     let listener = ListeningService(
       pid: 321,
@@ -114,29 +84,32 @@ enum LocalOpsTestRunner {
       address: "127.0.0.1:9124"
     )
     try await store.recordObserved(listener)
-    try check(try await store.listObserved().first?.port == 9124, "observed persistence")
+    let observedPort = try await store.listObserved().first?.port
+    XCTAssertEqual(observedPort, 9124, "observed persistence")
   }
 
-  private static func testSystemMetrics() async throws {
+  func testSystemMetrics() throws {
     let metrics = SystemMetricsReader().read()
-    try check(metrics.memoryTotalGb > 0, "physical memory missing")
-    try check(metrics.diskFreeGb >= 0, "invalid disk capacity")
-    try check(metrics.diskTotalGb >= metrics.diskFreeGb, "invalid disk total")
-    try check(metrics.cpuLoadOneMinute >= 0, "invalid CPU load")
-    try check(metrics.logicalProcessorCount > 0, "processor count missing")
-    try check(metrics.uptimeSeconds > 0, "uptime missing")
+    XCTAssertGreaterThan(metrics.memoryTotalGb, 0, "physical memory missing")
+    XCTAssertGreaterThanOrEqual(metrics.diskFreeGb, 0, "invalid disk capacity")
+    XCTAssertGreaterThanOrEqual(metrics.diskTotalGb, metrics.diskFreeGb, "invalid disk total")
+    XCTAssertGreaterThanOrEqual(metrics.cpuLoadOneMinute, 0, "invalid CPU load")
+    XCTAssertGreaterThan(metrics.logicalProcessorCount, 0, "processor count missing")
+    XCTAssertGreaterThan(metrics.uptimeSeconds, 0, "uptime missing")
 
     let encoded = try JSONEncoder().encode(metrics)
-    try check(
-      try JSONDecoder().decode(LocalOpsSystemMetrics.self, from: encoded) == metrics,
-      "metrics coding")
+    XCTAssertEqual(
+      try JSONDecoder().decode(LocalOpsSystemMetrics.self, from: encoded),
+      metrics,
+      "metrics coding"
+    )
   }
 
-  private static func testEngine() async throws {
-    let directory = try temporaryDirectory()
+  func testEngine() async throws {
+    let directory = try Self.temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let legacy = directory.appendingPathComponent("services.yaml")
-    try legacyYAML.write(to: legacy, atomically: true, encoding: .utf8)
+    try Self.legacyYAML.write(to: legacy, atomically: true, encoding: .utf8)
     let paths = LocalOpsPaths(
       applicationSupport: directory,
       database: directory.appendingPathComponent("localops.sqlite3"),
@@ -155,8 +128,14 @@ enum LocalOpsTestRunner {
       healthChecker: FixedHealthChecker()
     )
     let first = try await engine.initialize()
-    try check(first.services.contains { $0.id == "demo" && $0.source == .registered }, "registered")
-    try check(first.services.contains { $0.source == .discovered && $0.pid == 222 }, "discovered")
+    XCTAssertTrue(
+      first.services.contains { $0.id == "demo" && $0.source == .registered },
+      "registered"
+    )
+    XCTAssertTrue(
+      first.services.contains { $0.source == .discovered && $0.pid == 222 },
+      "discovered"
+    )
 
     let offlineEngine = try LocalOpsEngine(
       paths: paths,
@@ -164,12 +143,14 @@ enum LocalOpsTestRunner {
       healthChecker: FixedHealthChecker()
     )
     let second = try await offlineEngine.initialize()
-    try check(
-      second.services.contains { $0.source == .history && $0.id == listener.stableId }, "history")
+    XCTAssertTrue(
+      second.services.contains { $0.source == .history && $0.id == listener.stableId },
+      "history"
+    )
   }
 
-  private static func testRegistrationWorkflow() async throws {
-    let directory = try temporaryDirectory()
+  func testRegistrationWorkflow() async throws {
+    let directory = try Self.temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let listener = ListeningService(
       pid: 401,
@@ -189,20 +170,20 @@ enum LocalOpsTestRunner {
     _ = try await engine.initialize()
     try await engine.registerObserved(id: listener.stableId, name: "Workflow", group: "测试")
     let overview = await engine.overview()
-    try check(
+    XCTAssertTrue(
       overview.services.contains {
         $0.name == "Workflow" && $0.source == .registered && $0.endpoints.first?.port == 19_401
       },
       "registered service missing"
     )
-    try check(
-      !overview.services.contains { $0.id == listener.stableId && $0.source == .discovered },
+    XCTAssertFalse(
+      overview.services.contains { $0.id == listener.stableId && $0.source == .discovered },
       "registered listener still discovered"
     )
   }
 
-  private static func testForgetWorkflow() async throws {
-    let directory = try temporaryDirectory()
+  func testForgetWorkflow() async throws {
+    let directory = try Self.temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let paths = LocalOpsPaths(
       applicationSupport: directory,
@@ -223,9 +204,11 @@ enum LocalOpsTestRunner {
     _ = try await online.initialize()
     do {
       try await online.forgetObserved(id: listener.stableId)
-      throw TestFailure("online listener was forgotten")
+      XCTFail("online listener was forgotten")
     } catch is LocalOpsError {
       // Expected: online listeners remain discoverable until they stop.
+    } catch {
+      XCTFail("unexpected error: \(error)")
     }
 
     let offline = try LocalOpsEngine(
@@ -234,16 +217,17 @@ enum LocalOpsTestRunner {
       healthChecker: FixedHealthChecker()
     )
     let history = try await offline.initialize()
-    try check(history.services.contains { $0.id == listener.stableId }, "history missing")
+    XCTAssertTrue(history.services.contains { $0.id == listener.stableId }, "history missing")
     try await offline.forgetObserved(id: listener.stableId)
-    try check(
-      !(await offline.overview()).services.contains { $0.id == listener.stableId },
+    let forgottenOverview = await offline.overview()
+    XCTAssertFalse(
+      forgottenOverview.services.contains { $0.id == listener.stableId },
       "history was not forgotten"
     )
   }
 
-  private static func testWeb() async throws {
-    let directory = try temporaryDirectory()
+  func testWeb() async throws {
+    let directory = try Self.temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let engine = try LocalOpsEngine(
       paths: LocalOpsPaths(
@@ -256,38 +240,69 @@ enum LocalOpsTestRunner {
     _ = try await engine.initialize()
     let web = try LocalWebServer(engine: engine, port: 0)
     guard case .running(let baseURL) = await web.start() else {
-      throw TestFailure("FlyingFox did not start")
+      XCTFail("FlyingFox did not start")
+      return
     }
 
     let (page, pageResponse) = try await URLSession.shared.data(from: baseURL)
-    try check((pageResponse as? HTTPURLResponse)?.statusCode == 200, "web page status")
-    try check(String(decoding: page, as: UTF8.self).contains("此页只读"), "read-only page")
+    XCTAssertEqual((pageResponse as? HTTPURLResponse)?.statusCode, 200, "web page status")
+    let html = String(decoding: page, as: UTF8.self)
+    XCTAssertTrue(html.contains("此页只读"), "read-only page")
+    XCTAssertEqual(
+      html.components(separatedBy: #"aria-pressed="true""#).count - 1,
+      1,
+      "the initial filter selection must have one pressed button"
+    )
+    XCTAssertEqual(
+      html.components(separatedBy: #"aria-pressed="false""#).count - 1,
+      3,
+      "the initial filter selection must expose the other three buttons"
+    )
+
+    let scriptURL = baseURL.appendingPathComponent("static/localops.js")
+    let (script, scriptResponse) = try await URLSession.shared.data(from: scriptURL)
+    XCTAssertEqual((scriptResponse as? HTTPURLResponse)?.statusCode, 200, "script status")
+    let javascript = String(decoding: script, as: UTF8.self)
+    for marker in [
+      #"item.setAttribute("aria-pressed", String(selected));"#,
+      "const staleAfterSeconds = Number(typedState.stale_after_seconds);",
+      "const stale = disconnected || kind === \"stale\" || pastThreshold;",
+      "const ageText = formatAge(ageSeconds);",
+      "连接不可用",
+    ] {
+      XCTAssertTrue(javascript.contains(marker), "Web script regression missing: \(marker)")
+    }
 
     let overviewURL = baseURL.appendingPathComponent("api/v1/overview")
     let (data, response) = try await URLSession.shared.data(from: overviewURL)
-    try check((response as? HTTPURLResponse)?.statusCode == 200, "overview status")
+    XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200, "overview status")
     let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-    try check(json?["services"] != nil, "overview payload")
+    XCTAssertNotNil(json?["services"], "overview payload")
     let system = json?["system"] as? [String: Any]
-    try check(system?["thermal_state"] != nil, "thermal state payload")
-    try check(system?["cpu_load_one_minute"] != nil, "CPU load payload")
+    XCTAssertNotNil(system?["thermal_state"], "thermal state payload")
+    XCTAssertNotNil(system?["cpu_load_one_minute"], "CPU load payload")
 
-    var post = URLRequest(url: overviewURL)
-    post.httpMethod = "POST"
-    let (_, postResponse) = try await URLSession.shared.data(for: post)
-    try check((postResponse as? HTTPURLResponse)?.statusCode == 404, "mutating route exists")
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+      var request = URLRequest(url: overviewURL)
+      request.httpMethod = method
+      let (_, response) = try await URLSession.shared.data(for: request)
+      XCTAssertEqual(
+        (response as? HTTPURLResponse)?.statusCode,
+        404,
+        "mutating route exists for \(method)"
+      )
+    }
 
     let health = await SystemHealthChecker().probe(
       .init(type: .http, url: baseURL.appendingPathComponent("healthz").absoluteString)
     )
-    try check(health.health == .healthy, "health route")
+    XCTAssertEqual(health.health, .healthy, "health route")
     await web.stop()
-    try check(await web.state() == .stopped, "web stop")
+    let stoppedState = await web.state()
+    XCTAssertEqual(stoppedState, .stopped, "web stop")
   }
 
-  private static func check(_ condition: Bool, _ message: String) throws {
-    guard condition else { throw TestFailure(message) }
-  }
+  // MARK: - Fixtures
 
   private static func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
@@ -318,6 +333,7 @@ enum LocalOpsTestRunner {
 
 private struct FixedDiscovery: ServiceDiscovering {
   let listeners: [ListeningService]
+
   func scan() async throws -> [ListeningService] { listeners }
 }
 
@@ -325,9 +341,4 @@ private struct FixedHealthChecker: HealthChecking {
   func probe(_ check: ServiceHealthCheck) async -> ProbeResult {
     ProbeResult(lifecycle: .running, health: .healthy, latencyMs: 1)
   }
-}
-
-private struct TestFailure: Error, CustomStringConvertible {
-  let description: String
-  init(_ description: String) { self.description = description }
 }

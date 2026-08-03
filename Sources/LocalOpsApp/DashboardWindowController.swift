@@ -6,12 +6,13 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
   init(model: LocalOpsAppModel) {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 1020, height: 700),
-      styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+      styleMask: [.titled, .closable, .miniaturizable, .resizable],
       backing: .buffered,
       defer: false
     )
     window.title = "LocalOps"
-    window.titlebarAppearsTransparent = true
+    window.titleVisibility = .visible
+    window.titlebarAppearsTransparent = false
     window.minSize = NSSize(width: 780, height: 540)
     window.isReleasedWhenClosed = false
     window.center()

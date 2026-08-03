@@ -4,9 +4,11 @@ LocalOps 是一个纯 Swift 的 macOS 菜单栏应用，用来发现、登记和
 
 开源许可：[MIT License](LICENSE)。
 
+v1 支持 Apple Silicon（`arm64`）和 macOS 13 或更高版本。菜单栏、原生管理窗口和回环 Web 页面共享同一份状态，但都不会控制其他服务。
+
 ## 当前版本
 
-`v0.4.0` 已将产品运行链路全部迁移到 Swift：
+`v1.0.0` 是当前本地发布候选（尚未创建 tag 或 GitHub Release）；它沿用 `v0.4.0` Swift 迁移基线，并将可靠性、只读 Web、原生设置和诊断导出纳入候选门禁。`v0.4.0` 仅作为历史基线保留：
 
 - SwiftUI 菜单栏与原生管理窗口；
 - Swift Actor 状态内核；
@@ -44,8 +46,10 @@ FlyingFox 随 `LocalOps.app` 启动，只监听 <http://127.0.0.1:8042>。Web �
 
 ```bash
 swift build
-swift run LocalOpsTests
+swift test
 ```
+
+当前候选的 XCTest 门禁为 32 项真实断言（10 项行为 + 22 项可靠性），禁止以 `XCTSkip` 代替覆盖。
 
 构建 `.app`：
 
@@ -60,7 +64,7 @@ open build/LocalOps.app
 ./Scripts/build-dmg.sh
 ```
 
-开发构建默认使用 ad-hoc 签名。上传 GitHub 不要求 Apple Developer ID，但没有 Developer ID 签名和 notarization 时，其他用户首次打开需要在 Finder 中按住 Control 点击应用并选择“打开”。
+`Resources/Info.plist` 是版本和 build number 的唯一来源；打包脚本会拒绝环境变量、架构或最低系统版本漂移。开发构建默认使用 ad-hoc 签名。GitHub 免费分发不要求 Apple Developer ID，但没有 Developer ID 签名和 notarization 时，其他用户首次打开需要在 Finder 中按住 Control 点击应用并选择“打开”。
 
 ## 数据
 
@@ -82,3 +86,10 @@ open build/LocalOps.app
 - [测试报告](docs/TEST_REPORT.md)
 - [30 轮真实行为回归](docs/PRODUCT_TEST_30_ROUNDS.md)
 - [发布说明](docs/RELEASE.md)
+- [隐私说明](docs/PRIVACY.md)
+
+## 安装、升级和卸载
+
+从 GitHub Release 下载带有 `.sha256` 的 arm64 DMG，先用 `shasum -a 256` 校验，再把 App 拖入 `/Applications`。首次打开 ad-hoc 构建时，在 Finder 中按住 Control 点击 App，选择“打开”；不要为了 LocalOps 全局关闭 Gatekeeper。
+
+升级前退出 LocalOps，并备份 `~/Library/Application Support/LocalOps/`。下载并校验新的 DMG 后替换 `/Applications/LocalOps.app`；当前没有内置自动更新或一键回滚，保留旧 DMG 即可手动恢复。卸载时先关闭“登录后自动启动”、退出 App，再移除 App；确认不需要历史和迁移回滚文件后，才删除 Application Support 目录。完整步骤见 [安装说明](Resources/INSTALL.txt) 和 [发布说明](docs/RELEASE.md)。

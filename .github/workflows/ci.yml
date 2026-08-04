@@ -1,0 +1,68 @@
+name: LocalOps CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality gates
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Select pinned Xcode 16.4 toolchain
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == "arm64" ]] || {
+            echo "arm64 runner required" >&2
+            exit 1
+          }
+          DEVELOPER_DIR="/Applications/Xcode_16.4.app/Contents/Developer"
+          [[ -d "$DEVELOPER_DIR" ]] || {
+            echo "missing pinned toolchain: $DEVELOPER_DIR" >&2
+            exit 1
+          }
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          swift --version | tee /tmp/localops-swift-version.txt
+          grep -Eq 'Swift version 6\.1([.[:space:]]|$)|Apple Swift version 6\.1([.[:space:]]|$)' \
+            /tmp/localops-swift-version.txt
+
+      - name: Install quality tools
+        run: brew install swift-format gitleaks syft osv-scanner
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+          swift-format --version
+          gitleaks version
+          syft version
+          osv-scanner --version
+
+      - name: Strict Swift format
+        run: swift-format lint --recursive --strict Package.swift Sources tests
+
+      - name: Run build, XCTest, and security gates
+        run: ./Scripts/ci-quality.sh
+
+      - name: Upload quality reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: localops-ci-reports-${{ github.run_number }}
+          if-no-files-found: error
+          path: build/ci/

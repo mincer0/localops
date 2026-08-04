@@ -1,14 +1,50 @@
-LocalOps 安装说明
+LocalOps v1 安装、升级和卸载
 
-1. 将“LocalOps.app”拖入右侧的“Applications”文件夹。
-2. 从“应用程序”启动 LocalOps，它会常驻菜单栏。
-3. 菜单栏和原生管理窗口可查看、登记本地服务。
-4. 只读 Web 页面固定为 http://127.0.0.1:8042，随 App 启动和退出。
+支持范围
 
-当前 GitHub 开发构建使用 ad-hoc 签名。如果 macOS 首次打开时提示无法验证开发者，
-请在 Finder 中按住 Control 点击 LocalOps.app，选择“打开”。
+- Apple Silicon（arm64）
+- macOS 13 或更高版本
+- 只读本机目录；不会启动、停止、重启或杀死其他服务
 
-服务、历史和状态统一保存在：
-~/Library/Application Support/LocalOps/.data/localops.sqlite3
+首次安装
 
-旧版 services.yaml 和 claimed-services.yaml 只在升级时读取一次，新版运行不再依赖 YAML、Python 或 FastAPI。
+1. 从 GitHub Release 下载 `LocalOps-X.Y.Z-arm64.dmg` 和同名 `.sha256` 文件。
+2. 在终端校验下载文件（文件名按实际版本替换）：
+
+   `shasum -a 256 LocalOps-X.Y.Z-arm64.dmg`
+
+   输出的摘要必须与 `.sha256` 文件一致。摘要不一致时不要打开文件。
+3. 打开 DMG，把 `LocalOps.app` 拖到右侧的 `Applications` 文件夹，然后推出磁盘映像。
+4. 这是没有 Apple Developer ID/notarization 的 ad-hoc 构建。首次打开时，在 Finder 中按住 Control 点击 `LocalOps.app`，选择“打开”，再确认“打开”。也可以在“系统设置 → 隐私与安全性”中对被拦截的 App 选择“仍要打开”。不要为了 LocalOps 全局关闭 Gatekeeper。
+
+运行和边界
+
+- App 常驻菜单栏，同时提供原生管理窗口。
+- 只读 Web 页面固定监听 `http://127.0.0.1:8042`，仅在 App 运行期间存在，不监听局域网。
+- 本版只发现、登记、健康检查和记录历史，不执行任意 shell，也不提供服务启停控制。
+- 健康检查请只配置可信的本机地址；不要把密码、Bearer token 或 API key 放进 URL。
+
+升级和回滚
+
+1. 在升级前退出 LocalOps，并复制整个目录作为备份：
+
+   `~/Library/Application Support/LocalOps/`
+
+2. 下载新的 DMG，重复 SHA-256 校验，退出旧 DMG 后将新 App 拖入 `/Applications` 替换旧版本。
+3. 首次启动会保留旧 YAML/数据库作为迁移来源；如果迁移或启动失败，不要删除备份，保留旧 DMG 并通过 GitHub issue 提供错误信息（不要贴数据库或健康响应）。
+4. 当前没有内置自动更新、签名 appcast 或一键回滚。回滚方式是退出 App、用旧 DMG 恢复旧 App，并在需要时从备份恢复 Application Support 数据。
+
+卸载和数据删除
+
+1. 在设置中关闭“登录后自动启动”。
+2. 退出 LocalOps，确认菜单栏消失且 `127.0.0.1:8042` 不再监听。
+3. 从 `/Applications` 移除 `LocalOps.app`。
+4. 卸载不会自动删除历史和迁移备份。确认不再需要它们后，再删除：
+
+   `~/Library/Application Support/LocalOps/`
+
+故障排查
+
+- “无法验证开发者”：确认 SHA-256 后使用 Finder Control-click → 打开，或在“隐私与安全性”中选择“仍要打开”；不要关闭系统 Gatekeeper。
+- Web 显示不可用：确认没有其他程序占用 `127.0.0.1:8042`，退出并重新启动 LocalOps。
+- 服务显示异常：先在服务自己的入口确认服务状态；LocalOps 只读观察，不会替你启动服务。

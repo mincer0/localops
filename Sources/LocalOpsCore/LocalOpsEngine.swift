@@ -25,14 +25,29 @@ public actor LocalOpsEngine {
 
   @discardableResult
   public func initialize() async throws -> LocalOpsOverview {
-    try await store.migrate()
-    let legacyDefinitions = LegacyServiceMigrator().load(from: paths.legacyServices)
-    for definition in legacyDefinitions {
-      try? await store.saveDefinition(definition, replace: false)
+    do {
+      try await store.backupIfNeeded(
+        to: paths.database.appendingPathExtension("preflight.sqlite3")
+      )
+      try await store.migrate()
+      try await migrateLegacyDefinitionsIfNeeded()
+      try await store.seedDefaults(try Self.loadDefaultDefinitions())
+      initialized = true
+      let state = try await store.refreshState()
+      cachedOverview.metadata.generation = state.generation
+      cachedOverview.metadata.successfulAt = state.successfulAt
+      let refreshed = await refresh()
+      guard refreshed.snapshotProjection().ready else {
+        throw LocalOpsError.commandFailed(
+          refreshed.error ?? "LocalOps 首次刷新未产生可用快照"
+        )
+      }
+      return refreshed
+    } catch {
+      initialized = false
+      markFailure(error, attemptedAt: Date())
+      throw error
     }
-    try await store.seedDefaults(try Self.loadDefaultDefinitions())
-    initialized = true
-    return await refresh()
   }
 
   public func overview() -> LocalOpsOverview {
@@ -43,46 +58,130 @@ public actor LocalOpsEngine {
     cachedOverview.services.first { $0.id == id }
   }
 
+  /// Read the persisted registration, including disabled services that are not
+  /// present in the current runtime overview.
+  public func definition(id: String) async throws -> ServiceDefinition? {
+    try await store.loadDefinition(id: id)
+  }
+
+  /// Read the complete editable registration catalog, including disabled
+  /// services. The result is validated and stably sorted by Core; this method
+  /// never probes, starts, stops, or otherwise controls a user service.
+  public func definitions() async throws -> [ServiceDefinition] {
+    try await store.definitions()
+  }
+
+  /// Update registration metadata only. This operation validates and persists
+  /// the definition, then refreshes observations; it never invokes a process,
+  /// launchd, container, CLI, or recovery command.
+  public func updateRegisteredDefinition(_ definition: ServiceDefinition) async throws {
+    let value = try definition.validated()
+    guard try await store.loadDefinition(id: value.id) != nil else {
+      throw LocalOpsError.invalidService("找不到登记服务：\(value.id)")
+    }
+    try await store.updateDefinition(value)
+    _ = await refresh()
+  }
+
+  /// Clear only LocalOps' current database catalog, preserving the schema,
+  /// migration markers, legacy YAML, and legacy SQLite rollback source. The
+  /// built-in bundle is loaded and validated before the destructive operation;
+  /// deletion and reseeding then happen in one Store transaction. Once the
+  /// transaction, checkpoint/VACUUM, and preflight-backup cleanup complete, a
+  /// refresh is attempted and its overview is returned. A thrown error means
+  /// one of those steps failed; a successful return means the clear committed,
+  /// while `overview.error`/metadata may still report that the best-effort
+  /// refresh could not collect a fresh snapshot. No user process or service
+  /// manager is touched by this API.
+  @discardableResult
+  public func clearCurrentDirectoryData() async throws -> LocalOpsOverview {
+    let defaults = try Self.loadDefaultDefinitions()
+    let attemptedAt = Date()
+    do {
+      try await store.clearCurrentDirectoryData(seeding: defaults, completedAt: attemptedAt)
+      try await store.checkpointAndVacuum()
+      try removePreflightBackup()
+
+      // Do not expose snapshots from before the clear if discovery fails. A
+      // failed post-clear refresh therefore returns an empty overview with a
+      // failed/unknown projection, allowing the caller to distinguish it
+      // from a successful fresh refresh without claiming false service state.
+      initialized = true
+      cachedOverview = .empty
+      return await refresh()
+    } catch {
+      initialized = false
+      markFailure(error, attemptedAt: attemptedAt)
+      throw error
+    }
+  }
+
   @discardableResult
   public func refresh() async -> LocalOpsOverview {
-    guard initialized else {
-      cachedOverview.error = LocalOpsError.notInitialized.localizedDescription
-      return cachedOverview
+    // Initialization is retryable.  This is important for a transient file
+    // permission/SQLite failure: callers need not restart the App to recover.
+    if !initialized {
+      do {
+        return try await initialize()
+      } catch {
+        markFailure(error, attemptedAt: Date())
+        return cachedOverview
+      }
     }
 
+    let attemptedAt = Date()
     do {
       let definitions = try await store.loadDefinitions()
       let listeners: [ListeningService]
-      var scanError: String?
       do {
         listeners = try await discovery.scan()
       } catch {
-        listeners = []
-        scanError = error.localizedDescription
+        // A failed scan cannot prove anything about process presence.  Keep
+        // the last successful snapshot rather than replacing it with false
+        // offline states.
+        markFailure(error, attemptedAt: attemptedAt)
+        return cachedOverview
       }
 
       let probes = await probe(definitions)
       let now = Date()
       var registered: [ServiceSnapshot] = []
+      var refreshWasPartial = false
       for (definition, result) in zip(definitions, probes) {
-        let listener = matchListener(ports: definition.ports, listeners: listeners)
-        let snapshot = registeredSnapshot(
-          definition: definition,
-          probe: result,
-          listener: listener
+        // `.none` deliberately reports unknown health/lifecycle because no
+        // check was configured; that expected state does not make this
+        // otherwise successful refresh partial. Probe freshness for actual
+        // checks, plus ambiguous process attribution, does.
+        if definition.health.type != .none,
+          result.freshness == .partial || result.freshness == .unknown
+        {
+          refreshWasPartial = true
+        }
+        let match = matchListenerDetailed(
+          ports: definition.ports,
+          listeners: listeners,
+          hosts: definition.hosts
         )
-        registered.append(snapshot)
-        try await store.record(snapshot)
+        registered.append(
+          registeredSnapshot(definition: definition, probe: result, match: match)
+        )
+        if case .ambiguous = match {
+          refreshWasPartial = true
+        }
       }
 
       let knownPorts = Set(definitions.flatMap(\.ports))
       let candidates = discoveryCandidates(from: listeners, knownPorts: knownPorts)
-      var discovered: [ServiceSnapshot] = []
-      for listener in candidates {
-        try await store.recordObserved(listener, seenAt: now)
-        discovered.append(discoveredSnapshot(listener, seenAt: now))
-      }
+      let discovered = candidates.map { discoveredSnapshot($0, seenAt: now) }
 
+      let commit = try await store.commitRefresh(
+        snapshots: registered,
+        observed: candidates,
+        attemptedAt: attemptedAt,
+        successfulAt: now
+      )
+      let generation = commit.generation
+      registered = commit.snapshots
       let onlineObservedIds = Set(discovered.map(\.id))
       let observed = try await store.listObserved()
       let history = observed.compactMap { record -> ServiceSnapshot? in
@@ -91,28 +190,44 @@ public actor LocalOpsEngine {
         }
         return historySnapshot(record)
       }
-
       let events = try await store.listEvents(limit: 50)
+      let allServices = registered + discovered + history
+      let metadata = SnapshotMetadata(
+        generation: generation,
+        attemptedAt: attemptedAt,
+        successfulAt: now,
+        freshness: refreshWasPartial ? .partial : .fresh,
+        outcome: refreshWasPartial ? .partial : .success,
+        error: nil
+      )
       let summary = LocalOpsSummary(
         total: registered.count,
         healthy: registered.count { $0.health == .healthy },
-        attention: registered.count { $0.health == .unhealthy || $0.health == .degraded },
+        attention: registered.count {
+          $0.health == .unhealthy || $0.health == .degraded
+        },
         stopped: registered.count { $0.lifecycle == .stopped },
         discovered: discovered.count,
-        offlineHistory: history.count
+        offlineHistory: history.count,
+        unknown: registered.count {
+          $0.lifecycle == .unknown || $0.health == .unknown
+        },
+        stale: allServices.count {
+          $0.observation.freshness == .stale || $0.observation.freshness == .partial
+        }
       )
       cachedOverview = LocalOpsOverview(
-        services: registered + discovered + history,
+        services: allServices,
         summary: summary,
         system: metricsReader.read(),
         groups: Array(Set(registered.map(\.group))).sorted(),
         events: events,
         refreshedAt: now,
-        error: scanError
+        error: nil,
+        metadata: metadata
       )
     } catch {
-      cachedOverview.error = error.localizedDescription
-      cachedOverview.refreshedAt = Date()
+      markFailure(error, attemptedAt: attemptedAt)
     }
     return cachedOverview
   }
@@ -171,19 +286,53 @@ public actor LocalOpsEngine {
     return try catalog.services.map { try $0.validated() }
   }
 
+  private func removePreflightBackup() throws {
+    let backup = paths.database.appendingPathExtension("preflight.sqlite3")
+    guard FileManager.default.fileExists(atPath: backup.path) else { return }
+    try FileManager.default.removeItem(at: backup)
+  }
+
+  private func migrateLegacyDefinitionsIfNeeded() async throws {
+    let marker = "legacy-services-v1"
+    guard !(try await store.hasMigrationMarker(marker)) else { return }
+    let report = LegacyServiceMigrator().loadReport(from: paths.legacyServices)
+    guard report.errors.isEmpty else {
+      throw LocalOpsError.commandFailed(
+        "旧版服务迁移失败：" + report.errors.joined(separator: "；")
+      )
+    }
+    try await store.importLegacyDefinitions(report.definitions, marker: marker)
+  }
+
   private func probe(_ definitions: [ServiceDefinition]) async -> [ProbeResult] {
-    await withTaskGroup(of: (Int, ProbeResult).self, returning: [ProbeResult].self) { group in
-      for (index, definition) in definitions.enumerated() {
+    guard !definitions.isEmpty else { return [] }
+    let workerCount = min(8, definitions.count)
+    return await withTaskGroup(of: [(Int, ProbeResult)].self, returning: [ProbeResult].self) {
+      group in
+      for worker in 0..<workerCount {
         group.addTask { [healthChecker] in
-          (index, await healthChecker.probe(definition.health))
+          var values: [(Int, ProbeResult)] = []
+          var index = worker
+          while index < definitions.count {
+            if Task.isCancelled { break }
+            values.append((index, await healthChecker.probe(definitions[index].health)))
+            index += workerCount
+          }
+          return values
         }
       }
-      var values = [ProbeResult?](repeating: nil, count: definitions.count)
-      for await (index, result) in group {
-        values[index] = result
+      var output = [ProbeResult?](repeating: nil, count: definitions.count)
+      for await values in group {
+        for (index, result) in values { output[index] = result }
       }
-      return values.map {
-        $0 ?? ProbeResult(lifecycle: .unknown, health: .unknown, message: "检查未完成")
+      return output.map {
+        $0
+          ?? ProbeResult(
+            lifecycle: .unknown,
+            health: .unknown,
+            message: "检查未完成",
+            freshness: .unknown
+          )
       }
     }
   }
@@ -191,12 +340,49 @@ public actor LocalOpsEngine {
   private func registeredSnapshot(
     definition: ServiceDefinition,
     probe: ProbeResult,
-    listener: ListeningService?
+    match: ListenerMatch
   ) -> ServiceSnapshot {
     var lifecycle = probe.lifecycle
-    if listener != nil, lifecycle == .stopped || lifecycle == .unknown {
-      lifecycle = .running
+    var listener: ListeningService?
+    let observation: ObservationEvidence
+    switch match {
+    case .matched(let value):
+      listener = value
+      if lifecycle == .stopped || lifecycle == .unknown { lifecycle = .running }
+      observation = ObservationEvidence(
+        state: .observed,
+        freshness: .fresh,
+        host: value.normalizedHost,
+        port: value.port,
+        pid: value.pid,
+        processFingerprint: value.processFingerprint,
+        processName: value.processName,
+        executablePath: value.executablePath,
+        observedAt: probe.checkedAt,
+        matchConfidence: .hostPort
+      )
+    case .ambiguous:
+      if lifecycle == .unknown { lifecycle = .unknown }
+      observation = ObservationEvidence(
+        state: .ambiguous,
+        freshness: .partial,
+        message: "同一主机和端口存在多个监听进程，未归属 PID",
+        matchConfidence: .ambiguous
+      )
+    case .none:
+      observation = ObservationEvidence(
+        state: probe.lifecycle == .unknown ? .unknown : .notObserved,
+        freshness: .fresh,
+        observedAt: probe.checkedAt,
+        matchConfidence: .none
+      )
     }
+    let presence: ServicePresence =
+      switch lifecycle {
+      case .running: .online
+      case .stopped: .offline
+      case .unknown: .unknown
+      }
     return ServiceSnapshot(
       id: definition.id,
       name: definition.name,
@@ -208,16 +394,17 @@ public actor LocalOpsEngine {
       endpoints: definition.endpoints,
       latencyMs: probe.latencyMs,
       checkedAt: probe.checkedAt,
-      message: probe.message,
+      message: probe.message ?? observation.message,
       pid: listener?.pid,
       processName: listener?.processName,
       executablePath: listener?.executablePath,
       workingDirectory: listener?.workingDirectory,
       memoryMb: listener?.memoryMb,
       cpuPercent: listener?.cpuPercent,
-      presence: lifecycle == .stopped ? .offline : .online,
+      presence: presence,
       lastSeenAt: lifecycle == .stopped ? nil : probe.checkedAt,
-      responseSummary: probe.responseSummary
+      responseSummary: probe.responseSummary,
+      observation: observation
     )
   }
 
@@ -242,7 +429,19 @@ public actor LocalOpsEngine {
       cpuPercent: listener.cpuPercent,
       presence: .online,
       firstSeenAt: seenAt,
-      lastSeenAt: seenAt
+      lastSeenAt: seenAt,
+      observation: ObservationEvidence(
+        state: .observed,
+        freshness: .fresh,
+        host: listener.normalizedHost,
+        port: listener.port,
+        pid: listener.pid,
+        processFingerprint: listener.processFingerprint,
+        processName: listener.processName,
+        executablePath: listener.executablePath,
+        observedAt: seenAt,
+        matchConfidence: .hostPort
+      )
     )
   }
 
@@ -266,8 +465,31 @@ public actor LocalOpsEngine {
       workingDirectory: record.workingDirectory,
       presence: .offline,
       firstSeenAt: record.firstSeenAt,
-      lastSeenAt: record.lastSeenAt
+      lastSeenAt: record.lastSeenAt,
+      observation: ObservationEvidence(
+        state: .notObserved,
+        freshness: .stale,
+        host: record.host,
+        port: record.port,
+        pid: record.lastPid,
+        processName: record.processName,
+        executablePath: record.executablePath,
+        observedAt: record.lastSeenAt,
+        message: "当前扫描未发现监听进程",
+        matchConfidence: .none
+      )
     )
+  }
+
+  private func markFailure(_ error: Error, attemptedAt: Date) {
+    let hasSuccessful =
+      cachedOverview.metadata.successfulAt != nil || cachedOverview.refreshedAt != nil
+    cachedOverview.metadata.attemptedAt = attemptedAt
+    cachedOverview.metadata.outcome = .failed
+    cachedOverview.metadata.freshness = hasSuccessful ? .stale : .unknown
+    cachedOverview.metadata.error = error.localizedDescription
+    cachedOverview.error = error.localizedDescription
+    // `refreshedAt` deliberately remains the last successful timestamp.
   }
 
   private func uniqueServiceId(name: String, observedId: String) -> String {

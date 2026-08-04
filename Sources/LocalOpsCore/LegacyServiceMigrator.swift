@@ -3,18 +3,47 @@ import Foundation
 public struct LegacyServiceMigrator: Sendable {
   public init() {}
 
+  public struct Report: Sendable {
+    public var definitions: [ServiceDefinition]
+    public var errors: [String]
+
+    public init(definitions: [ServiceDefinition] = [], errors: [String] = []) {
+      self.definitions = definitions
+      self.errors = errors
+    }
+  }
+
   public func load(from files: [URL]) -> [ServiceDefinition] {
+    loadReport(from: files).definitions
+  }
+
+  public func loadReport(from files: [URL]) -> Report {
     var definitions: [ServiceDefinition] = []
+    var errors: [String] = []
     var ids = Set<String>()
     for file in files {
-      guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+      guard FileManager.default.fileExists(atPath: file.path) else { continue }
+      guard let text = try? String(contentsOf: file, encoding: .utf8) else {
+        errors.append("\(file.lastPathComponent) 无法读取")
+        continue
+      }
+      let before = definitions.count
       for definition in parse(text) {
         if ids.insert(definition.id).inserted {
           definitions.append(definition)
         }
       }
+      // Only the primary `services:` document has a required shape.  The
+      // claimed-services file came from several historical formats, so an
+      // empty, comment-only, or otherwise unrelated file must not be treated
+      // as a migration failure.  A non-empty services document that produces
+      // no valid definition is actionable (including inline forms such as
+      // `services: [broken`).
+      if nonEmptyServicesDocument(text) && definitions.count == before {
+        errors.append("\(file.lastPathComponent) 未解析出有效服务")
+      }
     }
-    return definitions
+    return Report(definitions: definitions, errors: errors)
   }
 }
 
@@ -102,24 +131,21 @@ extension LegacyServiceMigrator {
       }
       guard service != nil else { continue }
 
-      if indentation == 4, line == "endpoints:" {
-        flushEndpoint()
-        section = .endpoints
-        continue
-      }
-      if indentation == 4, line == "health:" {
-        flushEndpoint()
-        section = .health
-        continue
-      }
-      if indentation == 4, line == "manager:" || line == "tags:" {
-        flushEndpoint()
-        section = .ignored
-        continue
-      }
       if indentation == 4 {
         flushEndpoint()
-        section = .service
+        switch line {
+        case "endpoints:":
+          section = .endpoints
+          continue
+        case "health:":
+          section = .health
+          continue
+        case "manager:", "tags:":
+          section = .ignored
+          continue
+        default:
+          section = .service
+        }
       }
 
       switch section {
@@ -161,6 +187,43 @@ extension LegacyServiceMigrator {
     }
     flushService()
     return output
+  }
+
+  /// Return whether a YAML text contains a non-empty top-level `services:`
+  /// value. This intentionally does not classify arbitrary non-comment text
+  /// as a failed migration because claimed-services.yaml may use another
+  /// shape. Inline values (`services: [broken`) are considered non-empty and
+  /// therefore must report a parse error when no valid service is produced.
+  fileprivate func nonEmptyServicesDocument(_ text: String) -> Bool {
+    let lines = text.split(whereSeparator: \.isNewline)
+    for (index, rawLine) in lines.enumerated() {
+      let leadingSpaces = rawLine.prefix(while: { $0 == " " }).count
+      guard leadingSpaces == 0 else { continue }
+      let line = rawLine.trimmingCharacters(in: .whitespaces)
+      guard !line.isEmpty, !line.hasPrefix("#"), line.hasPrefix("services:") else {
+        continue
+      }
+      let value = String(line.dropFirst("services:".count))
+        .trimmingCharacters(in: .whitespaces)
+      if value.isEmpty {
+        // A block value is non-empty when it has any meaningful indented
+        // child before the next top-level key.
+        for child in lines.dropFirst(index + 1) {
+          let childIndent = child.prefix(while: { $0 == " " }).count
+          let childLine = child.trimmingCharacters(in: .whitespaces)
+          guard !childLine.isEmpty, !childLine.hasPrefix("#") else { continue }
+          if childIndent == 0 { break }
+          return true
+        }
+        return false
+      }
+      let withoutComment =
+        value.split(separator: "#", maxSplits: 1).first.map(String.init)
+        ?? value
+      let normalized = withoutComment.trimmingCharacters(in: .whitespaces)
+      return !normalized.isEmpty && normalized != "[]" && normalized != "[ ]"
+    }
+    return false
   }
 
   fileprivate func key(in line: String) -> String {

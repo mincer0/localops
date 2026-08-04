@@ -35,7 +35,18 @@ public struct ListeningService: Codable, Hashable, Sendable {
   }
 
   public var normalizedHost: String {
-    ["*", "::", "::1", "localhost"].contains(host) ? "127.0.0.1" : host
+    canonicalObservationHost(host)
+  }
+
+  /// A PID-independent identity for the observed process. Executable path is
+  /// preferred when available, while command name and working directory keep
+  /// the value useful for restricted `lsof` environments. It is intentionally
+  /// separate from `stableId`, which also includes host/port for history.
+  public var processFingerprint: String {
+    let material = [processName, executablePath ?? "", workingDirectory ?? ""].joined(
+      separator: "\0")
+    let digest = SHA256.hash(data: Data(material.utf8))
+    return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
   }
 
   public var stableId: String {
@@ -50,6 +61,12 @@ public protocol ServiceDiscovering: Sendable {
   func scan() async throws -> [ListeningService]
 }
 
+public enum ListenerMatch: Sendable {
+  case none
+  case matched(ListeningService)
+  case ambiguous
+}
+
 public struct SystemServiceDiscovery: ServiceDiscovering {
   private let runner: CommandRunner
 
@@ -58,9 +75,16 @@ public struct SystemServiceDiscovery: ServiceDiscovering {
   }
 
   public func scan() async throws -> [ListeningService] {
-    try await Task.detached(priority: .utility) {
+    let worker = Task.detached(priority: .utility) {
       try scanSynchronously(runner: runner)
-    }.value
+    }
+    return try await withTaskCancellationHandler(
+      operation: {
+        try await worker.value
+      },
+      onCancel: {
+        worker.cancel()
+      })
   }
 }
 
@@ -88,9 +112,55 @@ public func discoveryCandidates(
 
 public func matchListener(
   ports: Set<Int>,
-  listeners: [ListeningService]
+  listeners: [ListeningService],
+  hosts: Set<String>? = nil,
+  processName: String? = nil,
+  executablePath: String? = nil
 ) -> ListeningService? {
-  listeners.first { ports.contains($0.port) }
+  switch matchListenerDetailed(
+    ports: ports,
+    listeners: listeners,
+    hosts: hosts,
+    processName: processName,
+    executablePath: executablePath
+  ) {
+  case .matched(let listener): listener
+  case .none, .ambiguous: nil
+  }
+}
+
+/// Match a configured service to process evidence without ever assigning an
+/// arbitrary process merely because it happens to use the same port. Host and
+/// port are mandatory for Engine attribution; a caller may further narrow by
+/// process name/path. If more than one PID remains, the result is ambiguous
+/// and no PID is assigned. This avoids treating a reused PID as identity.
+public func matchListenerDetailed(
+  ports: Set<Int>,
+  listeners: [ListeningService],
+  hosts: Set<String>? = nil,
+  processName: String? = nil,
+  executablePath: String? = nil
+) -> ListenerMatch {
+  guard !ports.isEmpty else { return .none }
+  let canonicalHosts = hosts?.map(canonicalObservationHost)
+  var candidates = listeners.filter { listener in
+    guard ports.contains(listener.port) else { return false }
+    // The legacy public helper allowed port-only matching. Keep that behavior
+    // for callers that omit hosts; Engine always supplies configured hosts.
+    guard let canonicalHosts, !canonicalHosts.isEmpty else { return true }
+    return canonicalHosts.contains(listener.normalizedHost)
+  }
+  if let processName, !processName.isEmpty {
+    candidates = candidates.filter { $0.processName == processName }
+  }
+  if let executablePath, !executablePath.isEmpty {
+    candidates = candidates.filter { $0.executablePath == executablePath }
+  }
+  switch candidates.count {
+  case 0: return .none
+  case 1: return .matched(candidates[0])
+  default: return .ambiguous
+  }
 }
 
 public func parseListeningAddress(_ address: String) -> (host: String, port: Int)? {
@@ -112,7 +182,9 @@ public func parseListeningAddress(_ address: String) -> (host: String, port: Int
 private func scanSynchronously(runner: CommandRunner) throws -> [ListeningService] {
   let result = try runner.run(
     executable: "/usr/sbin/lsof",
-    arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]
+    arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"],
+    timeoutSeconds: 8,
+    maxOutputBytes: 4 * 1_024 * 1_024
   )
   guard result.status == 0 || result.status == 1 else {
     throw LocalOpsError.commandFailed(
@@ -173,7 +245,9 @@ private func readProcessInfo(pid: Int, runner: CommandRunner) -> ProcessDetails 
   var details = ProcessDetails()
   if let metrics = try? runner.run(
     executable: "/bin/ps",
-    arguments: ["-p", String(pid), "-o", "rss=", "-o", "%cpu="]
+    arguments: ["-p", String(pid), "-o", "rss=", "-o", "%cpu="],
+    timeoutSeconds: 3,
+    maxOutputBytes: 64 * 1_024
   ), metrics.status == 0 {
     let values = metrics.stdout.split(whereSeparator: \.isWhitespace)
     if values.count >= 2 {
@@ -184,7 +258,9 @@ private func readProcessInfo(pid: Int, runner: CommandRunner) -> ProcessDetails 
 
   if let files = try? runner.run(
     executable: "/usr/sbin/lsof",
-    arguments: ["-a", "-p", String(pid), "-d", "cwd,txt", "-Fn"]
+    arguments: ["-a", "-p", String(pid), "-d", "cwd,txt", "-Fn"],
+    timeoutSeconds: 3,
+    maxOutputBytes: 256 * 1_024
   ), files.status == 0 {
     var descriptor: String?
     for line in files.stdout.split(whereSeparator: \.isNewline) {
@@ -200,4 +276,14 @@ private func readProcessInfo(pid: Int, runner: CommandRunner) -> ProcessDetails 
     }
   }
   return details
+}
+
+private func canonicalObservationHost(_ host: String) -> String {
+  let value = host.trimmingCharacters(in: .whitespacesAndNewlines)
+    .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+    .lowercased()
+  switch value {
+  case "*", "0.0.0.0", "::", "::1", "localhost": return "127.0.0.1"
+  default: return value
+  }
 }

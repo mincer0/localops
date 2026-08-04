@@ -67,7 +67,7 @@
 - `/readyz` 初始化前/成功后/stale 后的状态由 XCTest 覆盖；
 - 真实浏览器证据记录为 1180/900/680/390 px 四档宽度 `overflow=0`，搜索和四档筛选、断连保留/自动重连通过，控制台 warning/error 为 0；
 - 重复启动只保留原 PID；正常退出后 8042 在 0.212s 释放；8042 冲突时原生进程继续运行。这些是运行证据，不等同于锁屏环境下的原生 UI 可访问性通过。
-- 最终候选 DMG `release/LocalOps-1.0.0-arm64.dmg` 的 SHA-256 为 `8f60e06e843a3bca360ffd7f8dd7c3245fa7da9b336347507ad9d299d05d4b3c`；App 与 dSYM UUID 均为 `30C27DCA-E4C8-3C46-9551-40A533D780B8`。
+- 重建后的候选 DMG `release/LocalOps-1.0.0-arm64.dmg` 的 SHA-256 为 `7c7d3ffc3524dad94feb420308c61439cd8649c5adebca5c1ecb3c3b647524a1`；App 与 dSYM UUID 均为 `30C27DCA-E4C8-3C46-9551-40A533D780B8`。
 - 最终打包后 Web 断连实测显示 `state=stale`、标题“连接不可用”，保留 5 张卡片；age 从 27 秒增长到 1 分钟仍继续增长，自动重连清除错误，Chrome 控制台为 0 warning/error。Chrome forced-dark 1180×900 实图无溢出、无截断，状态同时有文字/结构信息而非只靠颜色。
 
 ## 兼容与发布回归

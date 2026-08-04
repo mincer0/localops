@@ -35,7 +35,7 @@
 
 本轮 QA 运行证据：重复启动只保留原 PID；正常退出后 `8042` 在 `0.212s` 内释放；固定 `8042` 冲突时原生进程继续运行。真实浏览器已记录 1180/900/680/390 px 四档 `overflow=0`、搜索/四档筛选、断连保留与自动重连、控制台 0 warning/error；GET-only 非 GET 矩阵全部 404 且 generation 不变。
 
-最终候选构建身份：`release/LocalOps-1.0.0-arm64.dmg` SHA-256 为 `8f60e06e843a3bca360ffd7f8dd7c3245fa7da9b336347507ad9d299d05d4b3c`；App 与 dSYM UUID 均为 `30C27DCA-E4C8-3C46-9551-40A533D780B8`。打包后 Chrome forced-dark 1180×900 实图无溢出/截断，状态不只依靠颜色；断连显示 `state=stale`、标题“连接不可用”、保留 5 张卡片，age 从 27 秒增长到 1 分钟仍继续增长，自动重连清错且控制台 0 warning/error。
+重建后的候选构建身份：`release/LocalOps-1.0.0-arm64.dmg` SHA-256 为 `7c7d3ffc3524dad94feb420308c61439cd8649c5adebca5c1ecb3c3b647524a1`；App 与 dSYM UUID 均为 `30C27DCA-E4C8-3C46-9551-40A533D780B8`。打包后 Chrome forced-dark 1180×900 实图无溢出/截断，状态不只依靠颜色；断连显示 `state=stale`、标题“连接不可用”、保留 5 张卡片，age 从 27 秒增长到 1 分钟仍继续增长，自动重连清错且控制台 0 warning/error。
 
 当前 Mac 处于锁屏状态，菜单栏、原生管理窗口、VoiceOver、200% 字号、通知授权和 Web 断连重试按钮仍是明确人工 blocker，不能把它们写成已通过；这些项目必须在解锁设备和可授权环境中复核。
 

@@ -24,7 +24,7 @@ jobs:
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -110,7 +110,7 @@ jobs:
           } > build/candidate/BUILD-METADATA.txt
 
       - name: Upload candidate artifact only
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: LocalOps-${{ github.ref_name }}-candidate
           if-no-files-found: error

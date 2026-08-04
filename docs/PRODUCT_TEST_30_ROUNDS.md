@@ -49,7 +49,7 @@
 - 可靠性覆盖：两次失败阈值/恢复事件去重、发现失败 stale 保留、projection age/ready、生产 64 KiB 响应边界与 JSON 脱敏、真实命令取消、首次 discovery 自愈、0700/0600 权限、30 天/10,000 条事件上限、stdout/stderr 背压/超时/输出上限、loopback/端口/PID/重定向/超大响应、启用端口冲突原子性、`/readyz` 503/200、重复端口冲突、停止后复用端口、SQLite 完整性/marker/备份/WAL/exclusive lock、legacy 事务 rollback、clear 目录数据语义、PID 复用/ambiguous 归属、ObservationEvidence 兼容/fingerprint/confidence、GET-only Web 路由不触发扫描且 recovery note 不出现在 API、ServiceDefinition URL 边界；
 - 20 服务探测预算：每项健康检查延迟 100ms，生成 20 个 snapshot，总耗时约 0.365s（门禁 <5s），并发度观测在 2...8；
 - `build-app.sh`：arm64、minOS 13.0、严格 ad-hoc codesign、dSYM 通过；
-- `build-dmg.sh`：`hdiutil verify` 通过，SHA-256 sidecar 在 `release/` 目录内校验通过；最终 `LocalOps-1.0.0-arm64.dmg` SHA-256 为 `8f60e06e843a3bca360ffd7f8dd7c3245fa7da9b336347507ad9d299d05d4b3c`，App/dSYM UUID 均为 `30C27DCA-E4C8-3C46-9551-40A533D780B8`。
+- `build-dmg.sh`：`hdiutil verify` 通过，SHA-256 sidecar 在 `release/` 目录内校验通过；重建后的候选 `LocalOps-1.0.0-arm64.dmg` SHA-256 为 `7c7d3ffc3524dad94feb420308c61439cd8649c5adebca5c1ecb3c3b647524a1`，App/dSYM UUID 均为 `30C27DCA-E4C8-3C46-9551-40A533D780B8`。
 - 真实浏览器证据：1180/900/680/390 px 四档 `overflow=0`；搜索、四档筛选、断连保留/自动重连通过；控制台 0 warning、0 error。
 - 最终打包后 Chrome forced-dark 1180×900 实图检查无溢出/截断；断连时显示 `state=stale`、标题“连接不可用”，保留 5 张卡片，age 由 27 秒增长至 1 分钟仍继续增长；自动重连清错。
 - 当前 Mac 锁屏，菜单栏、原生窗口、VoiceOver、200% 字号、通知授权和断连重试按钮均明确列为人工 blocker，不得写成通过。
